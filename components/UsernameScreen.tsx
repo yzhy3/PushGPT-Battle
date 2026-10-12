@@ -1,12 +1,20 @@
 "use client";
 import { useState } from "react";
 
-export default function UsernameScreen({ onRegister }: { onRegister: (username: string) => void }) {
+export default function UsernameScreen({
+  onRegister,
+  isConnecting,
+  error,
+}: {
+  onRegister: (username: string) => void;
+  isConnecting?: boolean;
+  error?: string | null;
+}) {
   const [name, setName] = useState("");
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (name.trim().length > 2) {
+    if (name.trim().length > 2 && !isConnecting) {
       onRegister(name.trim());
     }
   };
@@ -16,22 +24,31 @@ export default function UsernameScreen({ onRegister }: { onRegister: (username: 
       <h1 className="text-3xl sm:text-5xl font-display font-extrabold text-white mb-2 tracking-tight text-center">
         PUSH<span className="text-green-primary">UP</span> BATTLE
       </h1>
-      <p className="text-slate-400 mb-8 text-sm sm:text-base text-center">Enter the 1v1 Fitness Esports Battle</p>
-      
+      <p className="text-slate-400 mb-8 text-sm sm:text-base text-center">
+        Enter the 1v1 Fitness Esports Battle
+      </p>
+
       <form onSubmit={handleSubmit} className="w-full max-w-sm flex flex-col gap-4">
         <input
           type="text"
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="Choose your username..."
-          className="bg-surface border border-slate-700 text-white text-lg px-4 py-3 rounded-lg focus:outline-none focus:border-blue-primary"
+          disabled={isConnecting}
+          className="bg-surface border border-slate-700 text-white text-lg px-4 py-3 rounded-lg focus:outline-none focus:border-blue-primary disabled:opacity-50"
         />
-        <button 
-          type="submit" 
-          className="bg-blue-primary hover:bg-blue-light text-white font-display font-bold text-lg py-3 rounded-lg transition-colors"
+        <button
+          type="submit"
+          disabled={isConnecting || name.trim().length <= 2}
+          className="bg-blue-primary hover:bg-blue-light text-white font-display font-bold text-lg py-3 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          ENTER BATTLE
+          {isConnecting ? "CONNECTING..." : "ENTER BATTLE"}
         </button>
+        {error && (
+          <p className="text-red-400 text-sm text-center bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
+            {error}
+          </p>
+        )}
       </form>
     </div>
   );
