@@ -3,182 +3,234 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import Dashboard from "@/components/Dashboard";
 import MatchScreen, { MatchData } from "@/components/MatchScreen";
 import ResultsScreen, { ResultsData } from "@/components/ResultsScreen";
-import UsernameScreen from "@/components/UsernameScreen";
+import AuthScreen from "@/components/AuthScreen";
+import Leaderboard from "@/components/Leaderboard";
+import SoloWorkout, { BotDifficulty } from "@/components/SoloWorkout";
 import GlobalNotifications from "@/components/GlobalNotifications";
 import { socket } from "@/lib/socket";
+import { useAuth } from "@/lib/authContext";
+import { AppScreen } from "@/lib/types";
+import {
+  applyMatchResult,
+  applyTrainingResult,
+  applyBotResult,
+} from "@/lib/userService";
 
 export default function Home() {
-  const [screen, setScreen] = useState<"username" | "dashboard" | "match" | "results">("username");
-  const [user, setUser] = useState<{ name: string; elo: number } | null>(null);
+  const { firebaseUser, profile, loading, setProfile, refreshProfile } = useAuth();
+  const [screen, setScreen] = useState<AppScreen>("auth");
   const [matchData, setMatchData] = useState<MatchData | null>(null);
   const [results, setResults] = useState<ResultsData | null>(null);
-  const [isConnecting, setIsConnecting] = useState(false);
+  const [soloDuration, setSoloDuration] = useState(60);
+  const [botDiff, setBotDiff] = useState<BotDifficulty>("medium");
   const [error, setError] = useState<string | null>(null);
-  const registerTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Estable entre renders: MatchScreen lo usa como dependencia de un effect (cámara/IA)
   const handleExitMatch = useCallback(() => setScreen("dashboard"), []);
 
+  // Navigate when auth state ready
   useEffect(() => {
+    if (loading) return;
+    if (firebaseUser && profile) {
+      setScreen((s) => (s === "auth" ? "dashboard" : s));
+    } else if (!firebaseUser) {
+      setScreen("auth");
+    }
+  }, [firebaseUser, profile, loading]);
+
+  // Socket events for PvP
+  useEffect(() => {
+    if (!profile) return;
+
     socket.connect();
 
-    // Vuelve a la pantalla de usuario (la sesión del servidor se pierde al reconectar)
-    const resetSession = (message: string) => {
-      if (registerTimeoutRef.current) {
-        clearTimeout(registerTimeoutRef.current);
-        registerTimeoutRef.current = null;
-      }
-      setIsConnecting(false);
-      setUser(null);
-      setMatchData(null);
-      setResults(null);
-      setScreen("username");
-      setError(message);
-    };
-
-    socket.on("connect", () => {
-      console.log("[Client] Socket connected");
-      // Solo limpia el error de "no se pudo conectar", no el de sesión perdida
-      setError((prev) => (prev && prev.startsWith("No se pudo conectar") ? null : prev));
-    });
-
-    socket.on("disconnect", (reason: string) => {
-      console.log("[Client] Socket disconnected:", reason);
-      if (reason === "io client disconnect") return;
-      resetSession("Se perdió la conexión con el servidor. Vuelve a entrar con tu usuario.");
-    });
-
-    socket.on("session_expired", () => {
-      resetSession("Tu sesión expiró. Vuelve a entrar con tu usuario.");
-    });
-
-    socket.on("register_error", (data: { message: string }) => {
-      if (registerTimeoutRef.current) {
-        clearTimeout(registerTimeoutRef.current);
-        registerTimeoutRef.current = null;
-      }
-      setIsConnecting(false);
-      setError(data.message);
-    });
-
-    socket.on("elo_update", (data: { eloChange: number }) => {
-      setUser((prev) => (prev ? { ...prev, elo: prev.elo + data.eloChange } : prev));
-    });
-
-    socket.on("connect_error", (err) => {
-      console.error("[Client] Socket connect_error:", err.message);
-      setIsConnecting(false);
-      setError(
-        "No se pudo conectar al servidor de batalla. Revisa que el backend esté desplegado y NEXT_PUBLIC_SOCKET_URL esté bien configurada en Vercel."
-      );
-    });
-
-    socket.on("registered", (data: { name: string; elo: number }) => {
-      console.log("[Client] Registered successfully");
-      if (registerTimeoutRef.current) {
-        clearTimeout(registerTimeoutRef.current);
-        registerTimeoutRef.current = null;
-      }
-      setIsConnecting(false);
-      setError(null);
-      setUser(data);
-      setScreen("dashboard");
+    socket.on("connect_error", () => {
+      // non-blocking for solo modes
+      console.warn("Socket connect error — PvP may be unavailable");
     });
 
     socket.on("match_found", (data: MatchData) => {
-      console.log("[Client] match_found received!", data);
       setMatchData(data);
       setScreen("match");
     });
 
-    socket.on("match_end", (data: ResultsData) => {
-      console.log("[Client] match_end received!");
+    socket.on("match_end", async (data: ResultsData) => {
       setResults(data);
       setScreen("results");
-      setUser((prev) => (prev ? { ...prev, elo: prev.elo + data.eloChange } : prev));
+
+      if (profile) {
+        let result: "win" | "loss" | "draw" = "draw";
+        if (data.winner === profile.username) result = "win";
+        else if (data.winner !== "draw") result = "loss";
+
+        const xpGain = Math.max(10, data.myReps * 2 + (result === "win" ? 25 : 5));
+        try {
+          const updated = await applyMatchResult(profile.uid, {
+            eloChange: data.eloChange,
+            myReps: data.myReps,
+            result,
+            xpGain,
+          });
+          if (updated) setProfile(updated);
+        } catch (e) {
+          console.error("applyMatchResult", e);
+        }
+      }
     });
 
-    socket.on("match_aborted", (data?: { message?: string }) => {
-      console.log("[Client] match_aborted received!");
-      alert(data?.message ?? "Opponent left the match before it started.");
+    socket.on("match_aborted", () => {
+      alert("Opponent left before the match started.");
       setMatchData(null);
       setScreen("dashboard");
     });
 
     return () => {
-      socket.off("connect");
       socket.off("connect_error");
-      socket.off("disconnect");
-      socket.off("session_expired");
-      socket.off("register_error");
-      socket.off("elo_update");
-      socket.off("registered");
       socket.off("match_found");
       socket.off("match_end");
       socket.off("match_aborted");
-      if (registerTimeoutRef.current) clearTimeout(registerTimeoutRef.current);
     };
-  }, []);
-
-  const handleRegister = (username: string) => {
-    setError(null);
-    setIsConnecting(true);
-
-    if (!socket.connected) {
-      socket.connect();
-    }
-
-    socket.emit("register", username);
-
-    // Si en 8s no llega "registered", mostrar error
-    if (registerTimeoutRef.current) clearTimeout(registerTimeoutRef.current);
-    registerTimeoutRef.current = setTimeout(() => {
-      setIsConnecting(false);
-      setError(
-        "El servidor no respondió. Despliega el backend (Railway/Render) y configura NEXT_PUBLIC_SOCKET_URL en Vercel."
-      );
-    }, 8000);
-  };
+  }, [profile?.uid, profile?.username, setProfile]);
 
   const handleFindMatch = (duration: number) => {
     socket.emit("find_match", duration);
   };
 
-  const handleFindNewMatch = () => {
-    setResults(null);
-    setScreen("dashboard");
+  const handleTraining = (duration: number) => {
+    setSoloDuration(duration);
+    setScreen("training");
   };
+
+  const handleBot = (duration: number, difficulty: BotDifficulty) => {
+    setSoloDuration(duration);
+    setBotDiff(difficulty);
+    setScreen("bot");
+  };
+
+  const handleSoloFinish = async (result: {
+    myReps: number;
+    botReps: number;
+    duration: number;
+  }) => {
+    if (!profile) {
+      setScreen("dashboard");
+      return;
+    }
+
+    if (screen === "training") {
+      try {
+        const updated = await applyTrainingResult(profile.uid, result.myReps, result.duration);
+        if (updated) setProfile(updated);
+      } catch (e) {
+        console.error(e);
+      }
+      setResults({
+        myReps: result.myReps,
+        oppReps: 0,
+        eloChange: 0,
+        winner: "training",
+      });
+      setScreen("results");
+      return;
+    }
+
+    // Bot
+    const won = result.myReps > result.botReps;
+    const draw = result.myReps === result.botReps;
+    const eloChange = draw ? 0 : won ? (botDiff === "hard" ? 16 : botDiff === "medium" ? 12 : 8) : (botDiff === "hard" ? -6 : botDiff === "medium" ? -10 : -12);
+    const xpGain = Math.max(10, result.myReps * 2 + (won ? 20 : 5));
+
+    try {
+      const updated = await applyBotResult(profile.uid, {
+        won: won && !draw,
+        myReps: result.myReps,
+        eloChange,
+        xpGain,
+      });
+      if (updated) setProfile(updated);
+    } catch (e) {
+      console.error(e);
+    }
+
+    setResults({
+      myReps: result.myReps,
+      oppReps: result.botReps,
+      eloChange,
+      winner: draw ? "draw" : won ? profile.username : "BOT",
+    });
+    setScreen("results");
+  };
+
+  if (loading) {
+    return (
+      <main className="min-h-screen flex items-center justify-center">
+        <p className="text-slate-400 font-display font-bold animate-pulse">Loading Arena...</p>
+      </main>
+    );
+  }
 
   return (
     <main className="min-h-screen">
       <GlobalNotifications />
 
-      {screen === "username" && (
-        <UsernameScreen
-          onRegister={handleRegister}
-          isConnecting={isConnecting}
-          error={error}
+      {screen === "auth" && <AuthScreen />}
+
+      {screen === "dashboard" && profile && (
+        <Dashboard
+          onFindMatch={handleFindMatch}
+          onTraining={handleTraining}
+          onBot={handleBot}
+          onLeaderboard={() => setScreen("leaderboard")}
         />
       )}
-      {screen === "dashboard" && user && (
-        <Dashboard user={user} onFindMatch={handleFindMatch} />
+
+      {screen === "leaderboard" && (
+        <Leaderboard onBack={() => setScreen("dashboard")} />
       )}
-      {screen === "match" && matchData && user && (
+
+      {screen === "match" && matchData && profile && (
         <MatchScreen
-          user={user}
+          user={{ name: profile.username, elo: profile.elo }}
           duration={matchData.duration}
           matchData={matchData}
           onMatchEnd={() => {}}
           onExit={handleExitMatch}
         />
       )}
-      {screen === "results" && results && user && (
+
+      {(screen === "training" || screen === "bot") && profile && (
+        <SoloWorkout
+          mode={screen === "training" ? "training" : "bot"}
+          duration={soloDuration}
+          difficulty={botDiff}
+          userName={profile.username}
+          onFinish={handleSoloFinish}
+          onExit={() => setScreen("dashboard")}
+        />
+      )}
+
+      {screen === "results" && results && profile && (
         <ResultsScreen
           results={results}
-          user={user}
-          onFindNewMatch={handleFindNewMatch}
-          onDashboard={() => setScreen("dashboard")}
+          user={{ name: profile.username, elo: profile.elo }}
+          onFindNewMatch={() => {
+            setResults(null);
+            setScreen("dashboard");
+          }}
+          onDashboard={() => {
+            setResults(null);
+            setScreen("dashboard");
+            refreshProfile();
+          }}
         />
+      )}
+
+      {error && (
+        <div className="fixed bottom-4 left-4 right-4 max-w-md mx-auto bg-red-500/20 border border-red-500 text-red-200 text-sm p-3 rounded-lg text-center z-50">
+          {error}
+          <button className="ml-2 underline" onClick={() => setError(null)}>
+            dismiss
+          </button>
+        </div>
       )}
     </main>
   );

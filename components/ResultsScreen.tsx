@@ -7,60 +7,102 @@ export interface ResultsData {
   winner: string;
 }
 
-interface User { name: string; elo: number; }
-
-interface ResultsScreenProps {
+export default function ResultsScreen({
+  results,
+  user,
+  onFindNewMatch,
+  onDashboard,
+}: {
   results: ResultsData;
-  user: User;
-  onFindNewMatch: () => void; // Changed from onRematch
+  user: { name: string; elo: number };
+  onFindNewMatch: () => void;
   onDashboard: () => void;
-}
+}) {
+  const isTraining = results.winner === "training";
+  const isDraw = results.winner === "draw";
+  const iWon = results.winner === user.name;
 
-export default function ResultsScreen({ results, user, onFindNewMatch, onDashboard }: ResultsScreenProps) {
+  let title = "DRAW";
+  let titleColor = "text-slate-300";
+  if (isTraining) {
+    title = "SESSION COMPLETE";
+    titleColor = "text-green-light";
+  } else if (iWon) {
+    title = "VICTORY";
+    titleColor = "text-green-light";
+  } else if (!isDraw) {
+    title = "DEFEAT";
+    titleColor = "text-red-400";
+  }
+
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-background">
-      <div className={`text-4xl sm:text-6xl md:text-8xl font-display font-extrabold mb-6 sm:mb-8 tracking-tight text-center ${
-        results.winner === "draw" ? 'text-slate-300' :
-        (user.name === results.winner ? 'text-green-light' : 'text-red-400')
-      }`}>
-        {results.winner === "draw" ? "DRAW" : (user.name === results.winner ? "VICTORY" : "DEFEAT")}
-      </div>
+    <div className="min-h-screen flex flex-col items-center justify-center bg-background p-4">
+      <h2 className={`text-4xl sm:text-6xl font-display font-extrabold mb-6 ${titleColor}`}>
+        {title}
+      </h2>
 
-      <div className="bg-surface border border-slate-800 rounded-xl p-4 sm:p-8 w-full max-w-md mb-6 sm:mb-8">
-        <div className="grid grid-cols-2 gap-4 sm:gap-8 text-center mb-6 sm:mb-8">
-          <div className="border-r border-slate-800 pr-4">
-            <h3 className="text-blue-light font-bold mb-2 text-sm sm:text-base truncate">{user.name}</h3>
-            <div className="text-3xl sm:text-5xl font-display font-extrabold text-white mb-2">{results.myReps}</div>
-            <div className="text-xs uppercase tracking-wider text-slate-500">Reps</div>
+      <div className="bg-surface border border-slate-800 rounded-2xl p-6 sm:p-8 w-full max-w-md mb-8">
+        <div className="flex justify-around items-center mb-6">
+          <div className="text-center">
+            <div className="text-xs text-slate-400 font-bold uppercase mb-1">You</div>
+            <div className="text-5xl font-display font-extrabold text-green-light">
+              {results.myReps}
+            </div>
+            <div className="text-xs text-slate-500 mt-1">reps</div>
           </div>
-          <div className="pl-4">
-            <h3 className="text-green-light font-bold mb-2 text-sm sm:text-base">Opponent</h3>
-            <div className="text-3xl sm:text-5xl font-display font-extrabold text-white mb-2">{results.oppReps}</div>
-            <div className="text-xs uppercase tracking-wider text-slate-500">Reps</div>
-          </div>
+          {!isTraining && (
+            <>
+              <div className="text-slate-600 font-bold text-xl">VS</div>
+              <div className="text-center">
+                <div className="text-xs text-slate-400 font-bold uppercase mb-1">
+                  {results.winner === "BOT" || results.oppReps >= 0 ? "Opponent" : "Opp"}
+                </div>
+                <div className="text-5xl font-display font-extrabold text-blue-light">
+                  {results.oppReps}
+                </div>
+                <div className="text-xs text-slate-500 mt-1">reps</div>
+              </div>
+            </>
+          )}
         </div>
 
-        <div className="text-center pt-4 sm:pt-6 border-t border-slate-800">
-          <div className="text-xs uppercase tracking-wider text-slate-500 mb-1">ELO Change</div>
-          <div className={`text-2xl sm:text-3xl font-display font-bold ${results.eloChange > 0 ? 'text-green-light' : 'text-red-400'}`}>
-            {results.eloChange > 0 ? '+' : ''}{results.eloChange}
+        {!isTraining && (
+          <div className="text-center border-t border-slate-800 pt-4">
+            <span className="text-slate-400 text-sm">ELO </span>
+            <span
+              className={`font-display font-bold text-lg ${
+                results.eloChange > 0
+                  ? "text-green-light"
+                  : results.eloChange < 0
+                  ? "text-red-400"
+                  : "text-slate-400"
+              }`}
+            >
+              {results.eloChange > 0 ? "+" : ""}
+              {results.eloChange}
+            </span>
           </div>
-          <div className="text-sm text-slate-400 mt-1">New ELO: {user.elo}</div>
-        </div>
+        )}
+
+        {isTraining && (
+          <p className="text-center text-slate-400 text-sm border-t border-slate-800 pt-4">
+            XP earned from this session has been added to your profile.
+          </p>
+        )}
       </div>
 
-      <div className="flex flex-col sm:flex-row gap-3 sm:gap-4 w-full max-w-md">
-        <button
-          onClick={onDashboard}
-          className="flex-1 bg-surface border border-slate-700 hover:border-slate-500 text-white font-bold py-3 sm:py-4 rounded-lg transition-colors text-sm sm:text-base"
-        >
-          BACK TO DASHBOARD
-        </button>
+      <div className="flex flex-col sm:flex-row gap-3 w-full max-w-md">
         <button
           onClick={onFindNewMatch}
-          className="flex-1 bg-blue-primary hover:bg-blue-light text-white font-bold py-3 sm:py-4 rounded-lg transition-colors shadow-lg shadow-blue-primary/30 text-sm sm:text-base"
+          className="flex-1 bg-blue-primary hover:bg-blue-light text-white font-display font-bold py-3 rounded-lg"
         >
-          FIND NEW MATCH
+          {isTraining ? "TRAIN AGAIN" : "PLAY AGAIN"}
+        </button>
+        <button
+          onClick={onDashboard}
+          className="flex-1 bg-surface border border-slate-700 hover:border-slate-500 text-white font-display font-bold py-3 rounded-lg"
+        >
+          DASHBOARD
         </button>
       </div>
     </div>
