@@ -22,10 +22,21 @@ export default function AuthScreen() {
         await register(email.trim(), password, username.trim());
       }
     } catch (err: unknown) {
-      const msg =
-        err instanceof Error
-          ? err.message.replace("Firebase: ", "").replace(/\(auth\/.*\)\.?/, "").trim()
-          : "Something went wrong";
+      console.error("Auth error:", err);
+      let msg = "Something went wrong";
+      if (err instanceof Error) {
+        msg = err.message
+          .replace(/^Firebase:\s*/i, "")
+          .replace(/\s*\(auth\/[^)]+\)\.?/g, "")
+          .trim();
+        if (/permission|PERMISSION_DENIED/i.test(err.message)) {
+          msg =
+            "Database permission denied. Open Firebase → Realtime Database → Rules and allow read/write (see README).";
+        }
+        if (/network|unavailable|Failed to get/i.test(err.message)) {
+          msg = "Network error connecting to Firebase. Check your connection.";
+        }
+      }
       setError(msg || "Authentication failed");
     } finally {
       setLoading(false);
@@ -45,7 +56,10 @@ export default function AuthScreen() {
         <div className="flex mb-6 rounded-lg overflow-hidden border border-slate-700">
           <button
             type="button"
-            onClick={() => { setMode("login"); setError(null); }}
+            onClick={() => {
+              setMode("login");
+              setError(null);
+            }}
             className={`flex-1 py-2 text-sm font-bold transition-colors ${
               mode === "login" ? "bg-blue-primary text-white" : "bg-transparent text-slate-400"
             }`}
@@ -54,7 +68,10 @@ export default function AuthScreen() {
           </button>
           <button
             type="button"
-            onClick={() => { setMode("register"); setError(null); }}
+            onClick={() => {
+              setMode("register");
+              setError(null);
+            }}
             className={`flex-1 py-2 text-sm font-bold transition-colors ${
               mode === "register" ? "bg-blue-primary text-white" : "bg-transparent text-slate-400"
             }`}
@@ -72,6 +89,7 @@ export default function AuthScreen() {
               placeholder="Username"
               maxLength={20}
               required
+              minLength={3}
               className="bg-background border border-slate-700 text-white px-4 py-3 rounded-lg focus:outline-none focus:border-blue-primary"
             />
           )}

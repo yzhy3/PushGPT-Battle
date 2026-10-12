@@ -18,7 +18,7 @@ export default function Leaderboard({ onBack }: { onBack: () => void }) {
         setRows(data);
       } catch (e) {
         console.error(e);
-        setError("Could not load leaderboard. Check Firestore rules.");
+        setError("Could not load leaderboard. Check Realtime Database rules.");
       } finally {
         setLoading(false);
       }

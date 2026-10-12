@@ -1,16 +1,13 @@
 import {
-  doc,
-  getDoc,
-  setDoc,
-  updateDoc,
-  collection,
+  ref,
+  get,
+  set,
+  update,
   query,
-  orderBy,
-  limit,
-  getDocs,
-  serverTimestamp,
-} from "firebase/firestore";
-import { db } from "./firebase";
+  orderByChild,
+  limitToLast,
+} from "firebase/database";
+import { rtdb } from "./firebase";
 import { UserProfile } from "./types";
 import { levelFromXp } from "./ranks";
 
@@ -48,17 +45,16 @@ export async function createUserProfile(
     botLosses: 0,
     createdAt: Date.now(),
   };
-  await setDoc(doc(db, "users", uid), profile);
+  await set(ref(rtdb, `users/${uid}`), profile);
   return profile;
 }
 
 export async function getUserProfile(uid: string): Promise<UserProfile | null> {
-  const snap = await getDoc(doc(db, "users", uid));
+  const snap = await get(ref(rtdb, `users/${uid}`));
   if (!snap.exists()) return null;
-  return snap.data() as UserProfile;
+  return snap.val() as UserProfile;
 }
 
-/** Update streak if user is active today; call on login / activity */
 export async function touchStreak(uid: string, profile: UserProfile): Promise<UserProfile> {
   const today = todayStr();
   if (profile.lastActiveDate === today) return profile;
@@ -69,9 +65,9 @@ export async function touchStreak(uid: string, profile: UserProfile): Promise<Us
   } else {
     streak = 1;
   }
-  const bestStreak = Math.max(profile.bestStreak, streak);
+  const bestStreak = Math.max(profile.bestStreak || 0, streak);
   const updates = { lastActiveDate: today, streak, bestStreak };
-  await updateDoc(doc(db, "users", uid), updates);
+  await update(ref(rtdb, `users/${uid}`), updates);
   return { ...profile, ...updates };
 }
 
@@ -87,24 +83,23 @@ export async function applyMatchResult(
   const profile = await getUserProfile(uid);
   if (!profile) return null;
 
-  const elo = Math.max(0, profile.elo + data.eloChange);
-  const xp = profile.xp + data.xpGain;
+  const elo = Math.max(0, (profile.elo || 1000) + data.eloChange);
+  const xp = (profile.xp || 0) + data.xpGain;
   const level = levelFromXp(xp);
-  const totalReps = profile.totalReps + data.myReps;
+  const totalReps = (profile.totalReps || 0) + data.myReps;
 
   const updates: Partial<UserProfile> = {
     elo,
     xp,
     level,
     totalReps,
-    wins: profile.wins + (data.result === "win" ? 1 : 0),
-    losses: profile.losses + (data.result === "loss" ? 1 : 0),
-    draws: profile.draws + (data.result === "draw" ? 1 : 0),
+    wins: (profile.wins || 0) + (data.result === "win" ? 1 : 0),
+    losses: (profile.losses || 0) + (data.result === "loss" ? 1 : 0),
+    draws: (profile.draws || 0) + (data.result === "draw" ? 1 : 0),
   };
 
-  await updateDoc(doc(db, "users", uid), updates);
-  const touched = await touchStreak(uid, { ...profile, ...updates } as UserProfile);
-  return touched;
+  await update(ref(rtdb, `users/${uid}`), updates);
+  return touchStreak(uid, { ...profile, ...updates } as UserProfile);
 }
 
 export async function applyTrainingResult(
@@ -116,16 +111,16 @@ export async function applyTrainingResult(
   if (!profile) return null;
 
   const xpGain = Math.max(5, Math.floor(reps * 2 + durationSec / 10));
-  const xp = profile.xp + xpGain;
+  const xp = (profile.xp || 0) + xpGain;
   const level = levelFromXp(xp);
 
   const updates: Partial<UserProfile> = {
     xp,
     level,
-    totalReps: profile.totalReps + reps,
-    trainingSessions: profile.trainingSessions + 1,
+    totalReps: (profile.totalReps || 0) + reps,
+    trainingSessions: (profile.trainingSessions || 0) + 1,
   };
-  await updateDoc(doc(db, "users", uid), updates);
+  await update(ref(rtdb, `users/${uid}`), updates);
   return touchStreak(uid, { ...profile, ...updates } as UserProfile);
 }
 
@@ -136,39 +131,53 @@ export async function applyBotResult(
   const profile = await getUserProfile(uid);
   if (!profile) return null;
 
-  const elo = Math.max(0, profile.elo + data.eloChange);
-  const xp = profile.xp + data.xpGain;
+  const elo = Math.max(0, (profile.elo || 1000) + data.eloChange);
+  const xp = (profile.xp || 0) + data.xpGain;
   const level = levelFromXp(xp);
 
   const updates: Partial<UserProfile> = {
     elo,
     xp,
     level,
-    totalReps: profile.totalReps + data.myReps,
-    botWins: profile.botWins + (data.won ? 1 : 0),
-    botLosses: profile.botLosses + (data.won ? 0 : 1),
-    wins: profile.wins + (data.won ? 1 : 0),
-    losses: profile.losses + (data.won ? 0 : 1),
+    totalReps: (profile.totalReps || 0) + data.myReps,
+    botWins: (profile.botWins || 0) + (data.won ? 1 : 0),
+    botLosses: (profile.botLosses || 0) + (data.won ? 0 : 1),
+    wins: (profile.wins || 0) + (data.won ? 1 : 0),
+    losses: (profile.losses || 0) + (data.won ? 0 : 1),
   };
-  await updateDoc(doc(db, "users", uid), updates);
+  await update(ref(rtdb, `users/${uid}`), updates);
   return touchStreak(uid, { ...profile, ...updates } as UserProfile);
 }
 
 export async function getLeaderboard(limitN = 50): Promise<UserProfile[]> {
-  const q = query(collection(db, "users"), orderBy("elo", "desc"), limit(limitN));
-  const snap = await getDocs(q);
-  return snap.docs.map((d) => d.data() as UserProfile);
+  try {
+    const q = query(ref(rtdb, "users"), orderByChild("elo"), limitToLast(limitN));
+    const snap = await get(q);
+    if (!snap.exists()) return [];
+    const list: UserProfile[] = [];
+    snap.forEach((child) => {
+      list.push(child.val() as UserProfile);
+    });
+    // limitToLast returns ascending; reverse for highest ELO first
+    return list.reverse();
+  } catch (e) {
+    // Fallback without index: load all users (fine for small apps)
+    console.warn("Leaderboard query failed, using fallback", e);
+    const snap = await get(ref(rtdb, "users"));
+    if (!snap.exists()) return [];
+    const list: UserProfile[] = [];
+    snap.forEach((child) => list.push(child.val() as UserProfile));
+    return list.sort((a, b) => (b.elo || 0) - (a.elo || 0)).slice(0, limitN);
+  }
 }
 
 export async function isUsernameTaken(username: string): Promise<boolean> {
-  // Simple scan of top users isn't enough — use a usernames collection
-  const ref = doc(db, "usernames", username.toLowerCase());
-  const snap = await getDoc(ref);
+  const snap = await get(ref(rtdb, `usernames/${username.toLowerCase()}`));
   return snap.exists();
 }
 
 export async function claimUsername(uid: string, username: string): Promise<void> {
-  await setDoc(doc(db, "usernames", username.toLowerCase()), {
+  await set(ref(rtdb, `usernames/${username.toLowerCase()}`), {
     uid,
     username,
     createdAt: Date.now(),
