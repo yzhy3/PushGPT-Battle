@@ -1,10 +1,17 @@
 import express from "express";
 import { createServer } from "http";
+import { randomUUID } from "crypto";
 import { Server, Socket } from "socket.io";
 import cors from "cors";
 
 const app = express();
 app.use(cors());
+
+// Health check (útil para Render/Railway y para "despertar" el servidor)
+app.get("/", (_req, res) => {
+  res.send("Battle Server OK");
+});
+
 const httpServer = createServer(app);
 
 const io = new Server(httpServer, {
@@ -20,16 +27,34 @@ interface User {
 
 interface Match {
   id: string;
-  players: string[];
+  players: [string, string];
   duration: number;
   scores: Record<string, number>;
-  startTime: number;
   readyPlayers: string[];
+  started: boolean; // true cuando ambos jugadores están listos (cuenta atrás en marcha)
+  timers: ReturnType<typeof setTimeout>[];
 }
 
-let users: Record<string, User> = {};
-let matchQueue: string[] = [];
-let activeMatches: Record<string, Match> = {};
+interface QueueEntry {
+  id: string;
+  duration: number;
+}
+
+interface PendingChallenge {
+  targetId: string;
+  duration: number;
+}
+
+const ALLOWED_DURATIONS = [60, 180, 300];
+const COUNTDOWN_MS = 4000; // 3-2-1-GO
+const READY_TIMEOUT_MS = 60_000; // máximo de espera a que ambos tengan la cámara lista
+const END_GRACE_MS = 1000; // margen para recibir las últimas reps
+
+const users: Record<string, User> = {};
+let matchQueue: QueueEntry[] = [];
+const activeMatches: Record<string, Match> = {};
+// challengerId -> desafío pendiente (un jugador solo puede tener uno a la vez)
+const pendingChallenges: Record<string, PendingChallenge> = {};
 
 const calculateElo = (winnerElo: number, loserElo: number) => {
   const expectedWinner = 1 / (1 + Math.pow(10, (loserElo - winnerElo) / 400));
@@ -40,276 +65,413 @@ const calculateElo = (winnerElo: number, loserElo: number) => {
   };
 };
 
+const getOnlineUsers = () =>
+  Object.values(users)
+    .filter(u => !u.inMatch)
+    .map(u => ({ username: u.username, elo: u.elo }));
+
+const broadcastOnlineUsers = () => {
+  io.emit("online_users", getOnlineUsers());
+};
+
+const removeFromQueue = (id: string) => {
+  matchQueue = matchQueue.filter(entry => entry.id !== id);
+};
+
+const clearMatchTimers = (match: Match) => {
+  match.timers.forEach(clearTimeout);
+  match.timers = [];
+};
+
+// Cancela el desafío que este usuario había enviado (si lo hay) y avisa al rival
+const cancelPendingChallenge = (challengerId: string) => {
+  const pending = pendingChallenges[challengerId];
+  if (!pending) return;
+  delete pendingChallenges[challengerId];
+  const challenger = users[challengerId];
+  if (challenger) {
+    io.to(pending.targetId).emit("challenge_cancelled", { fromUsername: challenger.username });
+  }
+};
+
+// Limpia todos los desafíos en los que participa un usuario (como retador o como objetivo)
+const clearChallengesInvolving = (userId: string, reasonForChallengers: string) => {
+  cancelPendingChallenge(userId);
+  for (const [challengerId, pending] of Object.entries(pendingChallenges)) {
+    if (pending.targetId === userId) {
+      delete pendingChallenges[challengerId];
+      io.to(challengerId).emit("challenge_failed", { message: reasonForChallengers });
+    }
+  }
+};
+
+// Cancela una partida que aún no empezó (nadie gana ni pierde ELO)
+const abortMatch = (matchId: string, message: string, exceptId?: string) => {
+  const match = activeMatches[matchId];
+  if (!match) return;
+  clearMatchTimers(match);
+  delete activeMatches[matchId];
+
+  for (const playerId of match.players) {
+    const player = users[playerId];
+    if (player) player.inMatch = false;
+    if (playerId !== exceptId) io.to(playerId).emit("match_aborted", { message });
+  }
+  broadcastOnlineUsers();
+};
+
+const endMatch = (matchId: string) => {
+  const match = activeMatches[matchId];
+  if (!match) return;
+  clearMatchTimers(match);
+  delete activeMatches[matchId];
+
+  const [p1, p2] = match.players;
+  const p1Reps = match.scores[p1] || 0;
+  const p2Reps = match.scores[p2] || 0;
+  const user1 = users[p1];
+  const user2 = users[p2];
+
+  if (user1) user1.inMatch = false;
+  if (user2) user2.inMatch = false;
+
+  // Defensivo: las desconexiones ya se gestionan en forfeitMatch
+  if (!user1 || !user2) {
+    const survivor = user1 || user2;
+    if (survivor) {
+      io.to(survivor.id).emit("match_end", {
+        myReps: match.scores[survivor.id] || 0,
+        oppReps: 0,
+        eloChange: 0,
+        winner: survivor.username
+      });
+    }
+    broadcastOnlineUsers();
+    return;
+  }
+
+  let p1EloChange = 0;
+  let p2EloChange = 0;
+  let winner = "draw";
+
+  if (p1Reps > p2Reps) {
+    winner = user1.username;
+    const elo = calculateElo(user1.elo, user2.elo);
+    p1EloChange = elo.winner;
+    p2EloChange = elo.loser;
+  } else if (p2Reps > p1Reps) {
+    winner = user2.username;
+    const elo = calculateElo(user2.elo, user1.elo);
+    p2EloChange = elo.winner;
+    p1EloChange = elo.loser;
+  }
+
+  user1.elo += p1EloChange;
+  user2.elo += p2EloChange;
+
+  io.to(p1).emit("match_end", { myReps: p1Reps, oppReps: p2Reps, eloChange: p1EloChange, winner });
+  io.to(p2).emit("match_end", { myReps: p2Reps, oppReps: p1Reps, eloChange: p2EloChange, winner });
+
+  broadcastOnlineUsers();
+};
+
+// Un jugador abandona (botón EXIT) o se desconecta
+const forfeitMatch = (matchId: string, leaverId: string) => {
+  const match = activeMatches[matchId];
+  if (!match || !match.players.includes(leaverId)) return;
+
+  // Si la partida no había empezado, simplemente se cancela
+  if (!match.started) {
+    abortMatch(matchId, "Opponent left the match before it started.", leaverId);
+    return;
+  }
+
+  const winnerId = match.players.find(id => id !== leaverId) as string;
+  const winner = users[winnerId];
+  const leaver = users[leaverId];
+
+  clearMatchTimers(match);
+  delete activeMatches[matchId];
+
+  let winnerChange = 10;
+  let leaverChange = 0;
+
+  if (leaver) {
+    leaver.inMatch = false;
+  }
+
+  if (winner) {
+    winner.inMatch = false;
+
+    if (leaver) {
+      const elo = calculateElo(winner.elo, leaver.elo);
+      winnerChange = elo.winner;
+      leaverChange = elo.loser;
+      leaver.elo += leaverChange;
+    }
+    winner.elo += winnerChange;
+
+    io.to(winnerId).emit("match_end", {
+      myReps: Math.max(1, match.scores[winnerId] || 0),
+      oppReps: 0,
+      eloChange: winnerChange,
+      winner: winner.username
+    });
+  }
+
+  // El que abandona ya está en el dashboard: solo actualizamos su ELO
+  if (leaver && leaverChange !== 0) {
+    io.to(leaverId).emit("elo_update", { eloChange: leaverChange });
+  }
+
+  broadcastOnlineUsers();
+};
+
 const startMatchLogic = (p1: User, p2: User, duration: number) => {
-  const matchId = `match-${Date.now()}`;
+  const matchId = randomUUID();
   const match: Match = {
     id: matchId,
     players: [p1.id, p2.id],
     duration,
     scores: { [p1.id]: 0, [p2.id]: 0 },
-    startTime: 0,
-    readyPlayers:[]
+    readyPlayers: [],
+    started: false,
+    timers: []
   };
 
   activeMatches[matchId] = match;
   p1.inMatch = true;
   p2.inMatch = true;
 
-  console.log(`[Server] Emitting match_found to ${p1.username} and ${p2.username}`);
+  // Ninguno de los dos puede seguir en cola ni tener desafíos pendientes
+  removeFromQueue(p1.id);
+  removeFromQueue(p2.id);
+  clearChallengesInvolving(p1.id, `${p1.username} is already in a match.`);
+  clearChallengesInvolving(p2.id, `${p2.username} is already in a match.`);
+
+  console.log(`[Server] Emitting match_found to ${p1.username} and ${p2.username} (${duration}s)`);
+  const startTime = Date.now();
   io.to(p1.id).emit("match_found", {
-    matchId, opponentName: p2.username, opponentElo: p2.elo, duration, startTime: match.startTime
+    matchId, opponentName: p2.username, opponentElo: p2.elo, duration, startTime
   });
   io.to(p2.id).emit("match_found", {
-    matchId, opponentName: p1.username, opponentElo: p1.elo, duration, startTime: match.startTime
+    matchId, opponentName: p1.username, opponentElo: p1.elo, duration, startTime
   });
 
-  setTimeout(() => {
-    if (activeMatches[matchId]) {
-      io.to(p1.id).emit("start_match");
-      io.to(p2.id).emit("start_match");
-    }
-  }, 4000);
+  // La partida NO empieza por tiempo: espera a que ambos envíen "player_ready".
+  // Si alguno nunca está listo, se cancela.
+  match.timers.push(
+    setTimeout(() => {
+      abortMatch(matchId, "Your opponent never got ready. Match cancelled.");
+    }, READY_TIMEOUT_MS)
+  );
 
-  setTimeout(() => endMatch(matchId), 4000 + (duration * 1000));
+  broadcastOnlineUsers();
 };
 
 io.on("connection", (socket: Socket) => {
   console.log(`User connected: ${socket.id}`);
-  const broadcastOnlineUsers = () => {
-    const onlineUsers = Object.values(users)
-      .filter(u => !u.inMatch)
-      .map(u => ({ username: u.username, elo: u.elo }));
-    io.emit("online_users", onlineUsers);
-  };
 
   socket.on("get_online_users", () => {
-    broadcastOnlineUsers();
+    socket.emit("online_users", getOnlineUsers());
   });
 
-  socket.on("register", (username: string) => {
+  socket.on("register", (rawName: unknown) => {
+    // Registro idempotente
+    const existing = users[socket.id];
+    if (existing) {
+      socket.emit("registered", { name: existing.username, elo: existing.elo });
+      return;
+    }
+
+    const username = typeof rawName === "string" ? rawName.trim().slice(0, 20) : "";
+    if (username.length < 3) {
+      socket.emit("register_error", { message: "El usuario debe tener al menos 3 caracteres." });
+      return;
+    }
+
+    const taken = Object.values(users).some(
+      u => u.username.toLowerCase() === username.toLowerCase()
+    );
+    if (taken) {
+      socket.emit("register_error", { message: "Ese nombre de usuario ya está en uso. Elige otro." });
+      return;
+    }
+
     users[socket.id] = { id: socket.id, username, elo: 1000, inMatch: false };
-    
-    // FIX: Send 'name' instead of 'username' so the frontend can read it
     socket.emit("registered", { name: username, elo: users[socket.id].elo });
-    
     broadcastOnlineUsers();
   });
 
-  // 2. Standard Matchmaking
-  socket.on("find_match", (duration: number) => {
+  // Matchmaking estándar (solo empareja jugadores que eligieron la misma duración)
+  socket.on("find_match", (rawDuration: number) => {
     const user = users[socket.id];
-    if (!user || user.inMatch) return;
+    if (!user) {
+      socket.emit("session_expired");
+      return;
+    }
+    if (user.inMatch) return;
 
-    const opponentId = matchQueue.find(id => users[id] && !users[id].inMatch && id !== socket.id);
+    const duration = ALLOWED_DURATIONS.includes(rawDuration) ? rawDuration : 60;
 
-    if (opponentId) {
-      const opponent = users[opponentId];
-      matchQueue = matchQueue.filter(id => id !== opponentId);
-      startMatchLogic(user, opponent, duration);
+    cancelPendingChallenge(socket.id);
+    removeFromQueue(socket.id);
+
+    const index = matchQueue.findIndex(
+      entry =>
+        entry.duration === duration &&
+        entry.id !== socket.id &&
+        users[entry.id] &&
+        !users[entry.id].inMatch
+    );
+
+    if (index !== -1) {
+      const [entry] = matchQueue.splice(index, 1);
+      startMatchLogic(user, users[entry.id], duration);
     } else {
-      if (!matchQueue.includes(socket.id)) matchQueue.push(socket.id);
+      matchQueue.push({ id: socket.id, duration });
       socket.emit("searching");
     }
   });
 
-  // 3. Direct Challenge System
-  socket.on("challenge_user", (data: { targetUsername: string, duration: number }) => {
+  // Sistema de desafíos directos
+  socket.on("challenge_user", (data: { targetUsername: string; duration: number }) => {
     const challenger = users[socket.id];
-    const target = Object.values(users).find(u => u.username === data.targetUsername);
-    
-    if (!challenger) return;
-
-    if (!target) {
-      socket.emit("challenge_failed", { message: "User is offline." });
+    if (!challenger) {
+      socket.emit("session_expired");
       return;
     }
-
-    if (target.inMatch) {
-      socket.emit("challenge_failed", { message: `${target.username} is already in a match.` });
-      return;
-    }
-
     if (challenger.inMatch) {
       socket.emit("challenge_failed", { message: "You are already in a match." });
       return;
     }
 
-    io.to(target.id).emit("challenge_received", {
-        fromUsername: challenger.username,
-        fromElo: challenger.elo,
-        duration: data.duration
+    const target = Object.values(users).find(u => u.username === data?.targetUsername);
+    if (!target) {
+      socket.emit("challenge_failed", { message: "User is offline." });
+      return;
     }
-    )
+    if (target.id === challenger.id) {
+      socket.emit("challenge_failed", { message: "You can't challenge yourself." });
+      return;
+    }
+    if (target.inMatch) {
+      socket.emit("challenge_failed", { message: `${target.username} is already in a match.` });
+      return;
+    }
+
+    const duration = ALLOWED_DURATIONS.includes(data.duration) ? data.duration : 60;
+
+    removeFromQueue(challenger.id);
+    cancelPendingChallenge(challenger.id); // reemplaza un desafío anterior si existía
+    pendingChallenges[challenger.id] = { targetId: target.id, duration };
+
+    io.to(target.id).emit("challenge_received", {
+      fromUsername: challenger.username,
+      fromElo: challenger.elo,
+      duration
+    });
   });
 
-  socket.on("respond_to_challenge", (data: { fromUsername: string, accepted: boolean, duration: number }) => {
-    console.log(`[Server] respond_to_challenge received from ${socket.id}`);
+  socket.on("respond_to_challenge", (data: { fromUsername: string; accepted: boolean }) => {
     const target = users[socket.id];
-    const challenger = Object.values(users).find(u => u.username === data.fromUsername);
-    
-    if (!target || !challenger){
-        console.log(`[Server] Either target or challenger not found.`);
-        return;
+    if (!target) {
+      socket.emit("session_expired");
+      return;
     }
 
-    if (data.accepted) {
-      // Double check they didn't get into a match while waiting
-      if (challenger.inMatch || target.inMatch) {
-        console.log(`[Server] Failed: someone is already in match.`);
-        io.to(target.id).emit("challenge_failed", { message: "Match failed to start. Someone is already playing." });
-        return;
-      }
-      console.log(`[Server] Starting match logic...`);
-      startMatchLogic(challenger, target, data.duration);
-    } else {
+    const challenger = Object.values(users).find(u => u.username === data?.fromUsername);
+    const pending = challenger ? pendingChallenges[challenger.id] : undefined;
+
+    // El desafío debe seguir vigente y estar dirigido a este usuario
+    if (!challenger || !pending || pending.targetId !== target.id) {
+      socket.emit("challenge_failed", { message: "That challenge is no longer available." });
+      return;
+    }
+
+    delete pendingChallenges[challenger.id];
+
+    if (!data.accepted) {
       console.log(`[Server] Challenge declined by ${target.username}`);
       io.to(challenger.id).emit("challenge_declined", { by: target.username });
+      return;
     }
-    });
+
+    if (challenger.inMatch || target.inMatch) {
+      const message = "Match failed to start. Someone is already playing.";
+      io.to(target.id).emit("challenge_failed", { message });
+      io.to(challenger.id).emit("challenge_failed", { message });
+      return;
+    }
+
+    console.log(`[Server] Challenge accepted: ${challenger.username} vs ${target.username}`);
+    startMatchLogic(challenger, target, pending.duration);
+  });
+
   socket.on("cancel_matchmaking", () => {
-    matchQueue = matchQueue.filter(id => id !== socket.id);
+    removeFromQueue(socket.id);
+    cancelPendingChallenge(socket.id);
   });
 
-  // Leave Match Early (Quit)
+  // Abandonar la partida (EXIT)
   socket.on("leave_match", (matchId: string) => {
-    const match = activeMatches[matchId];
-    if (!match) return;
-
-    const leaverId = socket.id;
-    const winnerId = match.players.find(id => id !== leaverId);
-
-    // 1. Reset leaver's state
-    if (users[leaverId]) {
-      users[leaverId].inMatch = false;
-    }
-
-    // 2. If there is a winner, reset their state and handle the match end
-    if (winnerId && users[winnerId]) {
-      users[winnerId].inMatch = false;
-
-      // If the match had already started, award the win to the other player
-      if (match.readyPlayers.length === 2) {
-        match.scores[leaverId] = 0;
-        const currentWinnerReps = match.scores[winnerId] || 0;
-        match.scores[winnerId] = Math.max(1, currentWinnerReps);
-        
-        const winner = users[winnerId];
-        io.to(winnerId).emit("match_end", {
-          myReps: match.scores[winnerId],
-          oppReps: 0,
-          eloChange: 10,
-          winner: winner.username
-        });
-      } else {
-        // If the match hadn't started yet, just tell the other player to go home
-        io.to(winnerId).emit("match_aborted");
-      }
-    }
-
-    // 3. Delete the match
-    delete activeMatches[matchId];
+    forfeitMatch(matchId, socket.id);
   });
 
-  // Sync: Wait for both players to have their cameras ready
+  // Sincronización: esperar a que ambos jugadores tengan la cámara lista
   socket.on("player_ready", (matchId: string) => {
     const match = activeMatches[matchId];
-    if (match && !match.readyPlayers.includes(socket.id)) {
+    if (!match || match.started || !match.players.includes(socket.id)) return;
+
+    if (!match.readyPlayers.includes(socket.id)) {
       match.readyPlayers.push(socket.id);
-      
-      // If both players are ready, start the countdown!
-      if (match.readyPlayers.length === 2) {
-        io.to(match.players[0]).emit("start_countdown");
-        io.to(match.players[1]).emit("start_countdown");
-        
-        // Start the match timer
+    }
+
+    if (match.readyPlayers.length === 2) {
+      match.started = true;
+      clearMatchTimers(match); // cancela el timeout de "listos"
+
+      match.players.forEach(playerId => io.to(playerId).emit("start_countdown"));
+
+      match.timers.push(
         setTimeout(() => {
           if (activeMatches[matchId]) {
-            io.to(match.players[0]).emit("start_match");
-            io.to(match.players[1]).emit("start_match");
+            match.players.forEach(playerId => io.to(playerId).emit("start_match"));
           }
-        }, 4000); // 4 seconds for 3-2-1 countdown
+        }, COUNTDOWN_MS)
+      );
 
-        setTimeout(() => endMatch(matchId), 4000 + (match.duration * 1000));
-      }
+      match.timers.push(
+        setTimeout(() => endMatch(matchId), COUNTDOWN_MS + match.duration * 1000 + END_GRACE_MS)
+      );
     }
   });
 
-  // 4. Real-time Rep Updates
+  // Actualizaciones de repeticiones en tiempo real
   socket.on("rep_update", (matchId: string, reps: number) => {
     const match = activeMatches[matchId];
-    if (match && match.players.includes(socket.id)) {
-      match.scores[socket.id] = reps;
-      const opponentId = match.players.find(id => id !== socket.id);
-      if (opponentId) io.to(opponentId).emit("opponent_rep_update", reps);
-    }
+    if (!match || !match.started || !match.players.includes(socket.id)) return;
+    if (typeof reps !== "number" || !Number.isFinite(reps) || reps < 0) return;
+
+    match.scores[socket.id] = Math.floor(reps);
+    const opponentId = match.players.find(id => id !== socket.id);
+    if (opponentId) io.to(opponentId).emit("opponent_rep_update", match.scores[socket.id]);
   });
 
   socket.on("disconnect", () => {
     console.log(`User disconnected: ${socket.id}`);
-    matchQueue = matchQueue.filter(id => id !== socket.id);
+    const user = users[socket.id];
+
+    removeFromQueue(socket.id);
+    clearChallengesInvolving(socket.id, `${user ? user.username : "User"} is offline.`);
+
+    const match = Object.values(activeMatches).find(m => m.players.includes(socket.id));
+    if (match) forfeitMatch(match.id, socket.id); // antes de borrar al usuario
+
     delete users[socket.id];
     broadcastOnlineUsers();
   });
 });
-
-function endMatch(matchId: string) {
-  const match = activeMatches[matchId];
-  if (!match) return;
-
-  const [p1, p2] = match.players;
-  const p1Reps = match.scores[p1] || 0;
-  const p2Reps = match.scores[p2] || 0;
-
-  const user1 = users[p1];
-  const user2 = users[p2];
-
-
-  if (!user1 || !user2) {
-    const winner = user1 || user2;
-    const winnerId = winner ? winner.id : null;
-    
-    if (winner && winnerId) {
-      winner.inMatch = false;
-      const myReps = match.scores[winnerId] || 0;
-      io.to(winnerId).emit("match_end", {
-        myReps: myReps,
-        oppReps: 0,
-        eloChange: 0, 
-        winner: winner.username
-      });
-    }
-    delete activeMatches[matchId];
-    return;
-  }
-
-  // Normal match end logic (both players present)
-  user1.inMatch = false;
-  user2.inMatch = false;
-
-  let p1EloChange = 0, p2EloChange = 0;
-  let winner = "";
-
-  if (p1Reps > p2Reps) {
-    winner = user1.username;
-    const elo = calculateElo(user1.elo, user2.elo);
-    p1EloChange = elo.winner; p2EloChange = elo.loser;
-    user1.elo += p1EloChange; user2.elo += p2EloChange;
-  } else if (p2Reps > p1Reps) {
-    winner = user2.username;
-    const elo = calculateElo(user2.elo, user1.elo);
-    p2EloChange = elo.winner; p1EloChange = elo.loser;
-    user2.elo += p2EloChange; user1.elo += p1EloChange;
-  }
-  else {
-    winner = "draw";
-  }
-  
-  io.to(p1).emit("match_end", { myReps: p1Reps, oppReps: p2Reps, eloChange: p1EloChange, winner });
-  io.to(p2).emit("match_end", { myReps: p2Reps, oppReps: p1Reps, eloChange: p2EloChange, winner });
-  
-  delete activeMatches[matchId];
-
-}
 
 const PORT = Number(process.env.PORT) || 3001;
 httpServer.listen(PORT, "0.0.0.0", () => {

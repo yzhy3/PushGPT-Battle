@@ -13,24 +13,24 @@ export default function Dashboard({ user, onFindMatch }: { user: User, onFindMat
   const [onlineUsers, setOnlineUsers] = useState<OnlineUser[]>([]);
 
   useEffect(() => {
-    socket.emit("get_online_users");
+    const handleOnlineUsers = (users: OnlineUser[]) => setOnlineUsers(users);
 
-    socket.on("online_users", (users: OnlineUser[]) => {
-      setOnlineUsers(users);
-    });
-
-    socket.on("challenge_declined", (data: { by: string }) => {
+    const handleDeclined = (data: { by: string }) => {
       alert(`${data.by} declined your challenge.`);
       setIsSearching(false);
-    });
+    };
 
-    socket.on("challenge_failed", () => {
-      setIsSearching(false);
-    });
+    const handleFailed = () => setIsSearching(false);
+
+    socket.on("online_users", handleOnlineUsers);
+    socket.on("challenge_declined", handleDeclined);
+    socket.on("challenge_failed", handleFailed);
+    socket.emit("get_online_users");
 
     return () => {
-      socket.off("online_users");
-      socket.off("challenge_declined");
+      socket.off("online_users", handleOnlineUsers);
+      socket.off("challenge_declined", handleDeclined);
+      socket.off("challenge_failed", handleFailed);
     };
   }, []);
 

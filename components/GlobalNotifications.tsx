@@ -21,12 +21,19 @@ export default function GlobalNotifications() {
       setChallenge(null);
     };
 
+    // El retador canceló o se desconectó: retira el aviso
+    const handleCancelled = (data: { fromUsername: string }) => {
+      setChallenge((prev) => (prev && prev.fromUsername === data.fromUsername ? null : prev));
+    };
+
     socket.on("challenge_received", handleChallenge);
     socket.on("challenge_failed", handleFailed);
+    socket.on("challenge_cancelled", handleCancelled);
 
     return () => {
       socket.off("challenge_received", handleChallenge);
       socket.off("challenge_failed", handleFailed);
+      socket.off("challenge_cancelled", handleCancelled);
     };
   }, []);
 

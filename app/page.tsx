@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import Dashboard from "@/components/Dashboard";
 import MatchScreen, { MatchData } from "@/components/MatchScreen";
 import ResultsScreen, { ResultsData } from "@/components/ResultsScreen";
@@ -16,12 +16,53 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const registerTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Estable entre renders: MatchScreen lo usa como dependencia de un effect (cámara/IA)
+  const handleExitMatch = useCallback(() => setScreen("dashboard"), []);
+
   useEffect(() => {
     socket.connect();
 
+    // Vuelve a la pantalla de usuario (la sesión del servidor se pierde al reconectar)
+    const resetSession = (message: string) => {
+      if (registerTimeoutRef.current) {
+        clearTimeout(registerTimeoutRef.current);
+        registerTimeoutRef.current = null;
+      }
+      setIsConnecting(false);
+      setUser(null);
+      setMatchData(null);
+      setResults(null);
+      setScreen("username");
+      setError(message);
+    };
+
     socket.on("connect", () => {
       console.log("[Client] Socket connected");
-      setError(null);
+      // Solo limpia el error de "no se pudo conectar", no el de sesión perdida
+      setError((prev) => (prev && prev.startsWith("No se pudo conectar") ? null : prev));
+    });
+
+    socket.on("disconnect", (reason: string) => {
+      console.log("[Client] Socket disconnected:", reason);
+      if (reason === "io client disconnect") return;
+      resetSession("Se perdió la conexión con el servidor. Vuelve a entrar con tu usuario.");
+    });
+
+    socket.on("session_expired", () => {
+      resetSession("Tu sesión expiró. Vuelve a entrar con tu usuario.");
+    });
+
+    socket.on("register_error", (data: { message: string }) => {
+      if (registerTimeoutRef.current) {
+        clearTimeout(registerTimeoutRef.current);
+        registerTimeoutRef.current = null;
+      }
+      setIsConnecting(false);
+      setError(data.message);
+    });
+
+    socket.on("elo_update", (data: { eloChange: number }) => {
+      setUser((prev) => (prev ? { ...prev, elo: prev.elo + data.eloChange } : prev));
     });
 
     socket.on("connect_error", (err) => {
@@ -57,9 +98,9 @@ export default function Home() {
       setUser((prev) => (prev ? { ...prev, elo: prev.elo + data.eloChange } : prev));
     });
 
-    socket.on("match_aborted", () => {
+    socket.on("match_aborted", (data?: { message?: string }) => {
       console.log("[Client] match_aborted received!");
-      alert("Opponent left the match before it started.");
+      alert(data?.message ?? "Opponent left the match before it started.");
       setMatchData(null);
       setScreen("dashboard");
     });
@@ -67,6 +108,10 @@ export default function Home() {
     return () => {
       socket.off("connect");
       socket.off("connect_error");
+      socket.off("disconnect");
+      socket.off("session_expired");
+      socket.off("register_error");
+      socket.off("elo_update");
       socket.off("registered");
       socket.off("match_found");
       socket.off("match_end");
@@ -124,7 +169,7 @@ export default function Home() {
           duration={matchData.duration}
           matchData={matchData}
           onMatchEnd={() => {}}
-          onExit={() => setScreen("dashboard")}
+          onExit={handleExitMatch}
         />
       )}
       {screen === "results" && results && user && (
